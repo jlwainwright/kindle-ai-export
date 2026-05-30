@@ -281,18 +281,50 @@ async function main() {
     await page.locator('input[type="submit"]').click()
 
     if (!/\/kindle-library/g.test(new URL(page.url()).pathname)) {
-      const code = await input({
-        message: '2-factor auth code?'
-      })
+      // Wait for an SMS/2FA code delivered out-of-band into /tmp/amazon_otp.txt
+      // (Amazon SMS is triggered the moment this verify screen loads above.)
+      // eslint-disable-next-line no-process-env
+      let code = process.env.AMAZON_OTP || ''
+      if (!code) {
+        const otpFile = '/tmp/amazon_otp.txt'
+        const fsx = await import('node:fs/promises')
+        console.log('WAITING_FOR_OTP_FILE ' + otpFile)
+        for (let i = 0; i < 100; i++) {
+          // up to ~8min (5s * 100)
+          try {
+            const c = (await fsx.readFile(otpFile, 'utf8')).trim()
+            if (/^\d{4,8}$/.test(c)) {
+              code = c
+              console.log('GOT_OTP_FROM_FILE')
+              break
+            }
+          } catch {}
+          await new Promise((r) => setTimeout(r, 5000))
+        }
+      }
+      if (!code) {
+        code = await input({ message: '2-factor auth code?' })
+      }
 
       // Only enter 2-factor auth code if needed
       if (code) {
-        await page.locator('input[type="tel"]').fill(code)
-        await page
-          .locator(
-            'input[type="submit"][aria-labelledby="cvf-submit-otp-button-announce"]'
-          )
-          .click()
+        // Amazon may show either the authenticator-app field (input[type="tel"])
+        // or the SMS CVF screen (input[name="otc"] + #continue). Handle both.
+        const telCount = await page.locator('input[type="tel"]').count()
+        const otcCount = await page.locator('input[name="otc"]').count()
+        if (otcCount > 0) {
+          await page.locator('input[name="otc"]').fill(code)
+          const cont = page.locator('#continue, input[type="submit"]').first()
+          await cont.click()
+        } else if (telCount > 0) {
+          await page.locator('input[type="tel"]').fill(code)
+          await page
+            .locator(
+              'input[type="submit"][aria-labelledby="cvf-submit-otp-button-announce"]'
+            )
+            .click()
+        }
+        await page.waitForTimeout(4000)
       }
     }
 
@@ -301,15 +333,161 @@ async function main() {
     }
   }
 
-  async function updateSettings() {
-    console.log('Looking for Reader settings button')
-    const settingsButton = page
+  async function firstVisibleLocator(
+    selectors: string[],
+    { timeout = 5000 }: { timeout?: number } = {}
+  ) {
+    const deadline = Date.now() + timeout
+    let lastErr: unknown
+
+    do {
+      for (const selector of selectors) {
+        const locator = page.locator(selector).first()
+        try {
+          if (await locator.isVisible({ timeout: 250 })) {
+            return locator
+          }
+        } catch (err) {
+          lastErr = err
+        }
+      }
+
+      await delay(100)
+    } while (Date.now() < deadline)
+
+    if (lastErr) {
+      console.warn('Selector lookup failed', String(lastErr))
+    }
+  }
+
+  async function clickFirstVisible(
+    selectors: string[],
+    {
+      timeout = 5000,
+      optional = false
+    }: { timeout?: number; optional?: boolean } = {}
+  ) {
+    const locator = await firstVisibleLocator(selectors, { timeout })
+    if (!locator) {
+      if (optional) {
+        return false
+      }
+
+      throw new Error(
+        `Unable to find visible selector: ${selectors.join(', ')}`
+      )
+    }
+
+    await locator.click()
+    return true
+  }
+
+  async function firstTextContent(selectors: string[]) {
+    for (const selector of selectors) {
+      const locator = page.locator(selector).first()
+      try {
+        if (await locator.isVisible({ timeout: 250 })) {
+          const text = await locator.textContent()
+          if (text?.trim()) {
+            return text
+          }
+
+          const ariaLabel = await locator.getAttribute('aria-label')
+          if (ariaLabel?.trim()) {
+            return ariaLabel
+          }
+        }
+      } catch {}
+    }
+  }
+
+  async function findPageNavTextFromDocument() {
+    return page.evaluate(() => {
+      const global = globalThis as any
+      const doc = global.document
+      const walker = doc.createTreeWalker(doc.body, 4)
+      let node = walker.nextNode()
+
+      while (node) {
+        const text = node.textContent?.replaceAll(/\s+/g, ' ').trim()
+        if (
+          text &&
+          /(page\s+\d+\s+of\s+\d+|location\s+\d+\s+of\s+\d+)/i.test(text)
+        ) {
+          return text
+        }
+
+        node = walker.nextNode()
+      }
+    })
+  }
+
+  async function revealReaderChrome() {
+    await page.mouse.move(640, 24).catch(() => undefined)
+    await page
       .locator(
-        'ion-button[aria-label="Reader settings"], ' +
-          'button[aria-label="Reader settings"]'
+        '#reader-header, .top-chrome, ion-header, [data-testid="reader-header"]'
       )
       .first()
-    await settingsButton.waitFor({ timeout: 30_000 })
+      .hover({ force: true, timeout: 1000 })
+      .catch(() => undefined)
+    await page.keyboard.press('Escape').catch(() => undefined)
+    await delay(200)
+  }
+
+  async function logReaderDiagnostics(tag: string) {
+    const diagnostics = await page.evaluate(() => {
+      const global = globalThis as any
+      const doc = global.document
+      const buttons = Array.from(
+        doc.querySelectorAll(
+          'button, ion-button, [role="button"], [aria-label]'
+        )
+      )
+        .map((el: any) => ({
+          tag: el.tagName.toLowerCase(),
+          text: el.textContent?.replaceAll(/\s+/g, ' ').trim().slice(0, 80),
+          ariaLabel: el.getAttribute('aria-label'),
+          id: el.id,
+          className:
+            typeof el.className === 'string'
+              ? el.className.slice(0, 80)
+              : undefined
+        }))
+        .filter((item) => item.text || item.ariaLabel || item.id)
+        .slice(0, 40)
+
+      return {
+        url: global.location.href,
+        title: doc.title,
+        text: doc.body?.textContent?.replaceAll(/\s+/g, ' ').slice(0, 800),
+        buttons
+      }
+    })
+    console.warn(`${tag}: ${JSON.stringify(diagnostics, null, 2)}`)
+  }
+
+  async function updateSettings() {
+    console.log('Looking for Reader settings button')
+    await revealReaderChrome()
+    const settingsButton = await firstVisibleLocator(
+      [
+        'ion-button[aria-label="Reader settings"]',
+        'button[aria-label="Reader settings"]',
+        '[aria-label="Reader settings"]',
+        'ion-button[aria-label="Aa"]',
+        'button[aria-label="Aa"]',
+        '[aria-label="Aa"]'
+      ],
+      { timeout: 30_000 }
+    )
+
+    if (!settingsButton) {
+      await logReaderDiagnostics('reader-settings-missing')
+      console.warn('Reader settings button not found; continuing with defaults')
+      return
+    }
+
     console.log('Clicking Reader settings')
     await settingsButton.click()
     await delay(500)
@@ -318,54 +496,139 @@ async function main() {
     // My hypothesis is that this font will be easier for OCR to transcribe...
     // TODO: evaluate different fonts & settings
     console.log('Changing font to Amazon Ember')
-    await page.locator('#AmazonEmber').click()
+    await clickFirstVisible(
+      [
+        '#AmazonEmber',
+        '[value="AmazonEmber"]',
+        '[aria-label="Amazon Ember"]',
+        'text=/Amazon\\s+Ember/i'
+      ],
+      { timeout: 2000, optional: true }
+    )
     await delay(200)
 
     // Change layout to single column
     console.log('Changing to single column layout')
-    await page
-      .locator('[role="radiogroup"][aria-label$=" columns"]', {
-        hasText: 'Single Column'
-      })
-      .click()
+    await clickFirstVisible(
+      [
+        '[role="radio"][aria-label*="Single Column"]',
+        '[role="radio"][aria-label*="single column" i]',
+        '[aria-label*="Single Column"]',
+        'text=/Single\\s+Column/i'
+      ],
+      { timeout: 2000, optional: true }
+    )
     await delay(200)
 
     console.log('Closing settings')
-    await settingsButton.click()
+    const closedSettings = await clickFirstVisible(
+      [
+        'ion-button[aria-label="Close"]',
+        'button[aria-label="Close"]',
+        '[aria-label="Close"]'
+      ],
+      { timeout: 1000, optional: true }
+    )
+    if (
+      !closedSettings &&
+      (await settingsButton.isVisible().catch(() => false))
+    ) {
+      await settingsButton.click()
+    }
     await delay(500)
   }
 
   async function goToPage(pageNumber: number) {
-    await page.locator('#reader-header').hover({ force: true })
+    await revealReaderChrome()
     await delay(200)
-    await page.locator('ion-button[aria-label="Reader menu"]').click()
+    await clickFirstVisible(
+      [
+        'ion-button[aria-label="Reader menu"]',
+        'button[aria-label="Reader menu"]',
+        '[aria-label="Reader menu"]',
+        'ion-button[aria-label="More options"]',
+        'button[aria-label="More options"]',
+        '[aria-label="More options"]'
+      ],
+      { timeout: 10_000 }
+    )
     await delay(500)
-    await page
-      .locator('ion-item[role="listitem"]', { hasText: 'Go to Page' })
-      .click()
-    await page
-      .locator('ion-modal input[placeholder="page number"]')
-      .fill(`${pageNumber}`)
+    await clickFirstVisible(
+      [
+        'ion-item[role="listitem"]:has-text("Go to Page")',
+        'ion-item:has-text("Go to Page")',
+        'button:has-text("Go to Page")',
+        '[role="menuitem"]:has-text("Go to Page")',
+        'text=/Go\\s+to\\s+Page/i'
+      ],
+      { timeout: 10_000 }
+    )
+    const pageInput = await firstVisibleLocator(
+      [
+        'ion-modal input[placeholder="page number"]',
+        'ion-modal input[placeholder*="page" i]',
+        'input[placeholder="page number"]',
+        'input[placeholder*="page" i]',
+        'input[type="number"]',
+        'input[type="tel"]'
+      ],
+      { timeout: 10_000 }
+    )
+    assert(pageInput, 'Unable to find go-to-page input')
+    await pageInput.fill(`${pageNumber}`)
     // await page.locator('ion-modal button', { hasText: 'Go' }).click()
-    await page
-      .locator('ion-modal ion-button[item-i-d="go-to-modal-go-button"]')
-      .click()
+    await clickFirstVisible(
+      [
+        'ion-modal ion-button[item-i-d="go-to-modal-go-button"]',
+        'ion-modal ion-button:has-text("Go")',
+        'ion-modal button:has-text("Go")',
+        'button:has-text("Go")'
+      ],
+      { timeout: 10_000 }
+    )
     await delay(500)
   }
 
   async function getPageNav() {
-    const footerText = await page
-      .locator('ion-footer ion-title')
-      .first()
-      .textContent()
+    const footerText =
+      (await firstTextContent([
+        'ion-footer ion-title',
+        'ion-footer',
+        '[role="contentinfo"]',
+        '[aria-label*="Page" i]',
+        '[aria-label*="Location" i]'
+      ])) ?? (await findPageNavTextFromDocument())
     return parsePageNav(footerText)
   }
 
   async function ensureFixedHeaderUI() {
-    await page.locator('.top-chrome').evaluate((el) => {
-      el.style.transition = 'none'
-      el.style.transform = 'none'
+    await revealReaderChrome()
+    const patched = await page.evaluate(() => {
+      const doc = (globalThis as any).document
+      const selectors = [
+        '.top-chrome',
+        '#reader-header',
+        'ion-header',
+        '[data-testid="reader-header"]',
+        '[class*="reader-header"]',
+        '[class*="ReaderHeader"]'
+      ]
+      const elements = selectors.flatMap((selector) =>
+        Array.from(doc.querySelectorAll(selector))
+      )
+
+      for (const el of elements as any[]) {
+        el.style.transition = 'none'
+        el.style.transform = 'none'
+        el.style.opacity = '1'
+      }
+
+      return elements.length
     })
+    if (!patched) {
+      await logReaderDiagnostics('reader-header-missing')
+      console.warn('Reader header not found; continuing without header patch')
+    }
   }
 
   async function dismissPossibleAlert() {
