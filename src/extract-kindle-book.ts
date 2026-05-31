@@ -1,7 +1,9 @@
 import 'dotenv/config'
 
+import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { promisify } from 'node:util'
 
 import type { SetRequired } from 'type-fest'
 import { input } from '@inquirer/prompts'
@@ -41,6 +43,18 @@ const urlRegexBlacklist = [
 
 type RENDER_METHOD = 'screenshot' | 'blob'
 const renderMethod: RENDER_METHOD = 'blob'
+const execFileAsync = promisify(execFile)
+
+function getRbwEnv() {
+  // eslint-disable-next-line no-process-env
+  const env = process.env
+  // eslint-disable-next-line no-process-env
+  const requestingAgent = process.env.RBW_REQUESTING_AGENT || 'kindle-ai-export'
+  return {
+    ...env,
+    RBW_REQUESTING_AGENT: requestingAgent
+  }
+}
 
 async function main() {
   const asin = getEnv('ASIN')
@@ -273,58 +287,42 @@ async function main() {
 
   // If we're on the signin page, start the authentication flow.
   if (/\/ap\/signin/g.test(new URL(page.url()).pathname)) {
-    await page.locator('input[type="email"]').fill(amazonEmail)
-    await page.locator('input[type="submit"]').click()
+    await page
+      .locator('#ap_email, input[type="email"]')
+      .first()
+      .fill(amazonEmail)
+    await page.locator('#continue, input[type="submit"]').first().click()
 
-    await page.locator('input[type="password"]').fill(amazonPassword)
+    const resolvedAmazonPassword =
+      amazonPassword || (await getPasswordFromRbw())
+    await page
+      .locator('#ap_password, input[type="password"]')
+      .first()
+      .fill(resolvedAmazonPassword)
     // await page.locator('input[type="checkbox"]').click()
-    await page.locator('input[type="submit"]').click()
+    await page.locator('#signInSubmit, input[type="submit"]').first().click()
+    await page.waitForTimeout(2000)
+    if (
+      /\/ap\/signin/g.test(new URL(page.url()).pathname) &&
+      (await page
+        .locator('#ap_password, input[type="password"]')
+        .first()
+        .isVisible()
+        .catch(() => false))
+    ) {
+      await page.keyboard.press('Enter')
+      await page.waitForTimeout(2000)
+    }
+    await throwIfAmazonRejectedPassword()
 
     if (!/\/kindle-library/g.test(new URL(page.url()).pathname)) {
-      // Wait for an SMS/2FA code delivered out-of-band into /tmp/amazon_otp.txt
-      // (Amazon SMS is triggered the moment this verify screen loads above.)
       // eslint-disable-next-line no-process-env
-      let code = process.env.AMAZON_OTP || ''
-      if (!code) {
-        const otpFile = '/tmp/amazon_otp.txt'
-        const fsx = await import('node:fs/promises')
-        console.log('WAITING_FOR_OTP_FILE ' + otpFile)
-        for (let i = 0; i < 100; i++) {
-          // up to ~8min (5s * 100)
-          try {
-            const c = (await fsx.readFile(otpFile, 'utf8')).trim()
-            if (/^\d{4,8}$/.test(c)) {
-              code = c
-              console.log('GOT_OTP_FROM_FILE')
-              break
-            }
-          } catch {}
-          await new Promise((r) => setTimeout(r, 5000))
-        }
-      }
-      if (!code) {
-        code = await input({ message: '2-factor auth code?' })
-      }
+      const code = process.env.AMAZON_OTP || (await getTwoFactorCode())
 
       // Only enter 2-factor auth code if needed
       if (code) {
-        // Amazon may show either the authenticator-app field (input[type="tel"])
-        // or the SMS CVF screen (input[name="otc"] + #continue). Handle both.
-        const telCount = await page.locator('input[type="tel"]').count()
-        const otcCount = await page.locator('input[name="otc"]').count()
-        if (otcCount > 0) {
-          await page.locator('input[name="otc"]').fill(code)
-          const cont = page.locator('#continue, input[type="submit"]').first()
-          await cont.click()
-        } else if (telCount > 0) {
-          await page.locator('input[type="tel"]').fill(code)
-          await page
-            .locator(
-              'input[type="submit"][aria-labelledby="cvf-submit-otp-button-announce"]'
-            )
-            .click()
-        }
-        await page.waitForTimeout(4000)
+        await submitTwoFactorCode(code)
+        await waitForAuthToComplete()
       }
     }
 
@@ -358,6 +356,209 @@ async function main() {
     if (lastErr) {
       console.warn('Selector lookup failed', String(lastErr))
     }
+  }
+
+  async function throwIfAmazonRejectedPassword() {
+    if (!/\/ap\/signin/g.test(new URL(page.url()).pathname)) {
+      return
+    }
+
+    const bodyText = await page
+      .locator('body')
+      .textContent()
+      .catch(() => '')
+    if (/password is incorrect/i.test(bodyText ?? '')) {
+      throw new Error('Amazon rejected the configured password')
+    }
+  }
+
+  async function submitTwoFactorCode(code: string) {
+    const otpInput = await firstVisibleLocator(
+      [
+        'input[name="otc"]',
+        'input[name="otpCode"]',
+        '#auth-mfa-otpcode',
+        'input[autocomplete="one-time-code"]',
+        'input[inputmode="numeric"]',
+        'input[type="tel"]',
+        'input[name="code"]'
+      ],
+      { timeout: 30_000 }
+    )
+
+    if (!otpInput) {
+      await logReaderDiagnostics('otp-input-missing')
+      throw new Error('Unable to find Amazon 2FA input')
+    }
+
+    await otpInput.fill(code)
+    await clickFirstVisible(
+      [
+        '#continue',
+        '#auth-signin-button',
+        'input[type="submit"][aria-labelledby="cvf-submit-otp-button-announce"]',
+        'input[type="submit"]',
+        'button[type="submit"]',
+        'button:has-text("Continue")',
+        'button:has-text("Sign in")'
+      ],
+      { timeout: 10_000 }
+    )
+  }
+
+  async function waitForAuthToComplete() {
+    await Promise.race([
+      page.waitForURL((url) => !/\/ap\/signin/.test(url.pathname), {
+        timeout: 30_000
+      }),
+      page.waitForURL('**/ap/cvf/**', { timeout: 30_000 }).catch(() => {}),
+      page.waitForTimeout(30_000)
+    ])
+
+    if (/\/ap\/signin/.test(new URL(page.url()).pathname)) {
+      await logReaderDiagnostics('auth-still-on-signin')
+      throw new Error('Amazon auth did not complete after submitting 2FA')
+    }
+  }
+
+  function getRbwEntries() {
+    // eslint-disable-next-line no-process-env
+    const configuredRbwEntry = process.env.AMAZON_RBW_ENTRY
+    const rbwEntries = [
+      configuredRbwEntry,
+      amazonEmail,
+      'amazon.com',
+      'amazon.co.za'
+    ].filter((entry, index, entries): entry is string => {
+      return Boolean(entry) && entries.indexOf(entry) === index
+    })
+
+    return rbwEntries
+  }
+
+  async function ensureRbwUnlocked(rbwEnv: NodeJS.ProcessEnv) {
+    const unlocked = await execFileAsync('rbw', ['unlocked'], {
+      env: rbwEnv,
+      timeout: 5000
+    })
+      .then(() => true)
+      .catch(() => false)
+
+    if (unlocked) {
+      return
+    }
+
+    await execFileAsync('rbw', ['stop-agent'], {
+      env: rbwEnv,
+      timeout: 5000
+    }).catch(() => undefined)
+
+    console.log(`UNLOCKING_RBW ${rbwEnv.RBW_REQUESTING_AGENT}`)
+    await execFileAsync('rbw-with-feedback', ['unlock'], {
+      env: rbwEnv,
+      timeout: 360_000
+    }).catch(async (err: any) => {
+      await execFileAsync('rbw', ['stop-agent'], {
+        env: rbwEnv,
+        timeout: 5000
+      }).catch(() => undefined)
+
+      if (err.code !== 'ENOENT') {
+        throw err
+      }
+
+      await execFileAsync('rbw', ['unlock'], {
+        env: rbwEnv,
+        timeout: 360_000
+      })
+    })
+  }
+
+  async function getPasswordFromRbw() {
+    const rbwEnv = getRbwEnv()
+
+    try {
+      await ensureRbwUnlocked(rbwEnv)
+
+      for (const rbwEntry of getRbwEntries()) {
+        console.log(`GETTING_PASSWORD_FROM_RBW ${rbwEntry}`)
+        const { stdout } = await execFileAsync('rbw', ['get', rbwEntry], {
+          env: rbwEnv,
+          timeout: 15_000
+        }).catch((err: any) => {
+          console.warn(
+            `rbw password lookup failed for ${rbwEntry}: ${err.message}`
+          )
+          return { stdout: '' }
+        })
+        const password = stdout.trim()
+
+        if (password) {
+          console.log(`GOT_PASSWORD_FROM_RBW ${rbwEntry}`)
+          return password
+        }
+      }
+    } catch (err: any) {
+      console.warn(`Unable to get password from rbw: ${err.message}`)
+    }
+
+    return ''
+  }
+
+  async function getCodeFromRbw() {
+    const rbwEnv = getRbwEnv()
+
+    try {
+      await ensureRbwUnlocked(rbwEnv)
+
+      for (const rbwEntry of getRbwEntries()) {
+        console.log(`GETTING_OTP_FROM_RBW ${rbwEntry}`)
+        const { stdout } = await execFileAsync('rbw', ['code', rbwEntry], {
+          env: rbwEnv,
+          timeout: 15_000
+        }).catch((err: any) => {
+          console.warn(`rbw OTP lookup failed for ${rbwEntry}: ${err.message}`)
+          return { stdout: '' }
+        })
+        const code = stdout.trim()
+
+        if (/^\d{4,8}$/.test(code)) {
+          console.log(`GOT_OTP_FROM_RBW ${rbwEntry}`)
+          return code
+        }
+      }
+
+      console.warn('rbw did not return a valid OTP from any Amazon entry')
+    } catch (err: any) {
+      console.warn(`Unable to get OTP from rbw: ${err.message}`)
+    }
+
+    return ''
+  }
+
+  async function getCodeFromOtpFile() {
+    const otpFile = '/tmp/amazon_otp.txt'
+    console.log('WAITING_FOR_OTP_FILE ' + otpFile)
+
+    for (let i = 0; i < 100; i++) {
+      // up to ~8min (5s * 100)
+      try {
+        const code = (await fs.readFile(otpFile, 'utf8')).trim()
+        if (/^\d{4,8}$/.test(code)) {
+          console.log('GOT_OTP_FROM_FILE')
+          return code
+        }
+      } catch {}
+
+      await delay(5000)
+    }
+
+    return ''
+  }
+
+  async function getTwoFactorCode() {
+    const code = (await getCodeFromRbw()) || (await getCodeFromOtpFile())
+    return code || input({ message: '2-factor auth code?' })
   }
 
   async function clickFirstVisible(
@@ -738,7 +939,9 @@ async function main() {
   await writeResultMetadata()
 
   // Navigate to the first content page of the book
-  await goToPage(result.nav.startContentPage)
+  if (initialPageNav?.page !== result.nav.startContentPage) {
+    await goToPage(result.nav.startContentPage)
+  }
 
   let done = false
   console.warn(
@@ -830,6 +1033,7 @@ async function main() {
     await writeResultMetadata()
 
     let retries = 0
+    const maxRetries = pageNav.page >= result.nav.totalNumContentPages ? 3 : 30
 
     do {
       // This delay seems to help speed up the navigation process, possibly due
@@ -872,7 +1076,7 @@ async function main() {
         break
       }
 
-      if (++retries >= 30) {
+      if (++retries >= maxRetries) {
         console.warn('unable to navigate to next page; breaking...', pageNav)
         done = true
         break
@@ -887,7 +1091,9 @@ async function main() {
   if (initialPageNav?.page !== undefined) {
     console.warn(`resetting back to initial page ${initialPageNav.page}...`)
     // Reset back to the initial page
-    await goToPage(initialPageNav.page)
+    await goToPage(initialPageNav.page).catch((err: any) => {
+      console.warn('unable to reset back to initial page', err.message)
+    })
   }
 
   await context.close()
