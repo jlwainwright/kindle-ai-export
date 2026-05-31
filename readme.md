@@ -1,10 +1,9 @@
 # Kindle AI Export <!-- omit from toc -->
 
-> Export any Kindle book you own as text, PDF, EPUB, or as a custom, AI-narrated audiobook. 🔥
+> Export Kindle books you own as cleaned Markdown, PDF, EPUB, or custom AI-narrated audiobooks.
 
 <p>
-  <a href="https://github.com/transitive-bullshit/kindle-ai-export/actions/workflows/main.yml"><img alt="Build Status" src="https://github.com/transitive-bullshit/kindle-ai-export/actions/workflows/main.yml/badge.svg" /></a>
-  <a href="https://github.com/transitive-bullshit/kindle-ai-export/blob/main/license"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue" /></a>
+  <a href="https://github.com/jlwainwright/kindle-ai-export/blob/main/license"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue" /></a>
   <a href="https://prettier.io"><img alt="Prettier Code Formatting" src="https://img.shields.io/badge/code_style-prettier-brightgreen.svg" /></a>
 </p>
 
@@ -28,15 +27,17 @@
 
 ## Intro
 
-This project makes it easy to export the contents of any ebook in your Kindle library as text, PDF, EPUB, or as a custom, AI-narrated audiobook. It only requires a valid Amazon Kindle account and an OpenAI API key.
+This project exports the contents of Kindle books you own by rendering the Kindle web reader, capturing page screenshots, and transcribing those screenshots with a multimodal LLM. From there, it can produce cleaned Markdown, PDF, EPUB, and AI-narrated audiobook outputs.
 
 _You must own the ebook on Kindle for this project to work._
 
 ### How does it work?
 
-It works by logging into your [Kindle web reader](https://read.amazon.com) account using [Playwright](https://playwright.dev), exporting each page of a book as a PNG image, and then using a vLLM (defaulting to `gpt-4.1-mini`) to transcribe the text from each page to text. Once we have the raw book contents and metadata, then it's easy to convert it to PDF, EPUB, etc. 🔥
+It logs into your [Kindle web reader](https://read.amazon.com) account with [Playwright](https://playwright.dev), captures each page as a PNG image, and uses a multimodal LLM (defaulting to `gpt-4.1-mini`) to transcribe the visible text.
 
-This [example](./examples/B0819W19WD) uses the first page of the scifi book [Revelation Space](https://www.amazon.com/gp/product/B0819W19WD?ref_=dbs_m_mng_rwt_calw_tkin_0&storeType=ebooks) by [Alastair Reynolds](https://www.goodreads.com/author/show/51204.Alastair_Reynolds):
+The export pipeline then uses the Kindle table of contents and page metadata to build clean reader-facing Markdown. It also writes an annotated Markdown file with page/capture markers for debugging OCR and page-boundary issues.
+
+This [example](./examples/B0819W19WD) uses the first page of the sci-fi book [Revelation Space](https://www.amazon.com/gp/product/B0819W19WD?ref_=dbs_m_mng_rwt_calw_tkin_0&storeType=ebooks) by [Alastair Reynolds](https://www.goodreads.com/author/show/51204.Alastair_Reynolds):
 
 <table>
   <tbody>
@@ -66,7 +67,7 @@ This [example](./examples/B0819W19WD) uses the first page of the scifi book [Rev
     </tr>
     <tr>
       <td>
-        We then convert each page's screenshot into text using one of OpenAI's vLLMs (<strong>gpt-4.1-mini</strong>.
+        We then convert each page's screenshot into text using a multimodal LLM (<strong>gpt-4.1-mini</strong> by default).
       </td>
       <td>
         <p>Mantell Sector, North Nekhebet, Resurgam, Delta Pavonis system, 2551</p>
@@ -77,7 +78,7 @@ This [example](./examples/B0819W19WD) uses the first page of the scifi book [Rev
     </tr>
     <tr>
       <td>
-        After doing this for each page, we now have access to the book's full contents and metadata, so we can export it in any format we want. 🎉
+        After doing this for each page, we have the book's transcribed contents and metadata, so we can export it in the format we need.
       </td>
       <td>
         <p>Here are some output previews containing only the first page of this book:</p>
@@ -137,26 +138,26 @@ Here are some auto-generated examples using a few different TTS providers & voic
 
 ### Why is this necessary?
 
-**Kindle uses a [custom AZW3 format](https://en.wikipedia.org/wiki/Kindle_File_Format) which includes heavy DRM**, making it very difficult to access the contents of ebooks that you own. It is possible to [strip the DRM using existing tools](#alternative-approaches), but it's a serious pain in the ass, is very difficult to automate, and the "best" solution is expensive and not open source.
+**Kindle uses a [custom AZW3 format](https://en.wikipedia.org/wiki/Kindle_File_Format) which includes heavy DRM**, making it very difficult to access the contents of ebooks that you own. It is possible to [strip the DRM using existing tools](#alternative-approaches), but the process is awkward to automate, and the most polished commercial options are paid and closed source.
 
 This project changes that.
 
-_Why?_ Because I love reading books on Kindle (especially scifi books!!), but none of the content is _hackable_. The official Kindle apps are also lagging behind in their AI features, so my goal with this project was to make it easy to build AI-powered experiments on top of my own Kindle library. In order to do that, I first needed a reliable way to export the contents of my Kindle books in a reasonable format.
+_Why?_ Because Kindle is convenient for reading, but the content is not easy to build on. The official Kindle apps are also lagging behind in AI features, so this project provides a practical export path for personal AI-powered experiments on top of books you own.
 
-I also created an [OSS TypeScript client for the unofficial Kindle API](https://github.com/transitive-bullshit/kindle-api), but I ended up only using some of the types and utils since Playwright + vLLMs allowed me to completely bypass their API and DRM. This approach should also be a lot less error-prone than using their unofficial API.
+I also created an [OSS TypeScript client for the unofficial Kindle API](https://github.com/transitive-bullshit/kindle-api), but I ended up only using some of the types and utils since Playwright plus multimodal LLMs allowed me to bypass their API and DRM. This approach should also be a lot less error-prone than using their unofficial API.
 
 ## Usage
 
-Make sure you have `node >= 18` and [pnpm](https://pnpm.io) installed.
+Make sure you have `node >= 20` and [pnpm](https://pnpm.io) installed.
 
 1. Clone this repo
 2. Run `pnpm install`
 3. Set up environment variables ([details](#setup-env-vars))
-4. Run `src/extract-kindle-book.ts` ([details](#extract-kindle-book))
-5. Run `src/transcribe-book-content.ts` ([details](#transcribe-book-content))
-6. (Optional) Run `src/export-book-pdf.ts` ([details](#optional-export-book-as-pdf))
-7. (Optional) Export book as EPUB ([details](#optional-export-book-as-epub))
-8. (Optional) Run `src/export-book-markdown.ts` ([details](#optional-export-book-as-markdown))
+4. Run `src/extract-kindle-book.ts` to capture page images and metadata ([details](#extract-kindle-book))
+5. Run `src/transcribe-book-content.ts` to create `content.json` ([details](#transcribe-book-content))
+6. Run `src/export-book-markdown.ts` to create cleaned Markdown ([details](#optional-export-book-as-markdown))
+7. (Optional) Run `src/export-book-pdf.ts` ([details](#optional-export-book-as-pdf))
+8. (Optional) Export book as EPUB ([details](#optional-export-book-as-epub))
 9. (Optional) Run `src/export-book-audio.ts` ([details](#optional-export-book-as-ai-narrated-audiobook-))
 
 ### Setup Env Vars
@@ -173,6 +174,26 @@ OPENAI_API_KEY=
 
 You can find your book's [ASIN](https://en.wikipedia.org/wiki/Amazon_Standard_Identification_Number) (Amazon ID) by visiting [read.amazon.com](https://read.amazon.com) and clicking on the book you want to export. The resulting URL will look like `https://read.amazon.com/?asin=B0819W19WD&ref_=kwl_kr_iv_rec_2`, with `B0819W19WD` being the ASIN in this case.
 
+Optional authentication helpers:
+
+```sh
+# One-time password override for accounts with 2FA enabled.
+AMAZON_OTP=
+
+# File watched by the login flow when AMAZON_OTP is not set.
+AMAZON_OTP_FILE=/tmp/amazon_otp.txt
+
+# Optional rbw / Bitwarden entry name for password and TOTP lookup.
+AMAZON_RBW_ENTRY=
+RBW_REQUESTING_AGENT=kindle-ai-export
+```
+
+Credential lookup order:
+
+1. `AMAZON_PASSWORD` / `AMAZON_OTP`
+2. `rbw` / Bitwarden, if available
+3. `AMAZON_OTP_FILE` for manual TOTP handoff
+
 ### Extract Kindle Book
 
 ```sh
@@ -181,7 +202,7 @@ npx tsx src/extract-kindle-book.ts
 
 - _(This takes a few minutes to run)_
 - This logs into your [Amazon Kindle web reader](https://read.amazon.com) using headless Chrome ([Playwright](https://playwright.dev)). It can be pretty fun to watch it run, so feel free to tweak the script to use `headless: false` to watch it do its thing.
-- If your account requires 2FA, the terminal will request a code from you before proceeding.
+- If your account requires 2FA, the script can use `AMAZON_OTP`, fetch a TOTP from `rbw`, or wait for a code to appear in `AMAZON_OTP_FILE`.
 - It uses a persistent browser session, so you should only have to auth once.
 - Once logged in, it navigates to the web reader page for a specific book (`https://read.amazon.com/?asin=${ASIN}`).
 - Then it changes the reader settings to use a single column and a sans-serif font.
@@ -202,10 +223,12 @@ npx tsx src/transcribe-book-content.ts
 ```
 
 - _(This takes a few minutes to run)_
-- This takes each of the page screenshots and runs them through a vLLM (defaulting to `gpt-4.1-mini`) to extract the raw text content from each page of the book.
+- This takes each page screenshot and runs it through a multimodal LLM (defaulting to `gpt-4.1-mini`) to extract the raw text content from each page of the book.
 - It then stitches these text chunks together, taking into account chapter boundaries.
 - The result is stored as JSON to `out/${asin}/content.json`.
 - Example: [examples/B0819W19WD/content.json](./examples/B0819W19WD/content.json)
+
+`content.json` is intentionally structured around page/capture chunks. The Markdown export step performs the reader-facing cleanup so the raw transcription remains available for inspection.
 
 ### (Optional) Export Book as PDF
 
@@ -237,7 +260,14 @@ npx tsx src/export-book-markdown.ts
 ```
 
 - _(This should run instantly)_
-- The result is stored to `out/${asin}/book.md`.
+- The reader-facing result is stored to `out/${asin}/book.md`.
+- A debug version with page/capture markers is stored to `out/${asin}/book.annotated.md`.
+- The exporter cleans common OCR/page-capture artifacts:
+  - joins sentences split across page screenshots
+  - removes duplicate TOC headings from transcribed chunks
+  - normalizes heading levels and blank lines
+  - builds the table of contents from the sections actually emitted
+  - handles Kindle page-label jumps where the next captured page still belongs to the previous chapter
 - Example: [examples/B0819W19WD/book-preview.md](./examples/B0819W19WD/book-preview.md)
 
 ### (Optional) Export Book as AI-Narrated Audiobook 🔥
@@ -256,7 +286,7 @@ npx tsx src/export-book-audio.ts
   - OpenAI TTS for a full novel (~1M tokens) is approximately **$30** (1.5GB MP3 ~21 hours long)
   - Unreal Speech TTS for a full novel (~1M tokens) is approximately **$2** (1.7GB MP3 ~23 hours long)
   - It should be pretty easy to support other TTS providers in the future.
-- The TTS will be broken up into reasonly sized chunks and stored in `mp3` files under `out/${asin}/audio/<tts-engine-hash>/`.
+- The TTS will be broken up into reasonably sized chunks and stored in `mp3` files under `out/${asin}/audio/<tts-engine-hash>/`.
   - The `<tts-engine-hash>` directory is based on the TTS engine settings and book contents
 - After generating audio for each chunk, we use `ffmpeg` to concat them together.
   - You need to have `ffmpeg` installed locally for this to work
@@ -270,11 +300,11 @@ npx tsx src/export-book-audio.ts
 
 ## Author's Notes
 
-This project will only work on Kindle books which you have access to in your personal library. **Please do not share the resulting exports publicly** – _we need to make sure that our authors and artists get paid fairly for their work_!
+This project only works on Kindle books you have access to in your personal library. **Please do not share the resulting exports publicly**. Authors and publishers should still be paid for their work.
 
-With that being said, I also feel strongly that we should individually be able to use content that we own in whatever format best suits our personal needs, especially if that involves building cool, open source experiments for LLM-powered book augmentation, realtime narration, and other unique AI-powered UX ideas.
+With that being said, I also feel strongly that we should individually be able to use content that we own in whatever format best suits our personal needs, especially if that involves building open source experiments for LLM-powered book augmentation, realtime narration, and other AI-powered reading workflows.
 
-I expect that Amazon Kindle will eventually get around to supporting some modern LLM-based features at some point in the future, but [ain't nobody got time to wait around for that](https://youtu.be/waEC-8GFTP4?t=25).
+I expect that Amazon Kindle will eventually support more modern LLM-based features, but this project makes that kind of experimentation possible today.
 
 ### Alternative Approaches
 
@@ -282,9 +312,9 @@ If you want to explore other ways of exporting your personal ebooks from Kindle,
 
 Compared with these approaches, the approach used by this project is much easier to automate. It also retains metadata about Kindle's original sync positions which is very useful for cases where you'd like to interoperate with Kindle. E.g., be able to jump from reading a Kindle book to listening to an AI-generated narration on a walk and then jumping back to reading the Kindle book and having the sync positions "just work".
 
-The main downside is that it's possible for some transcription errors to occur during the `image ⇒ text` step - which uses a multimodal LLM and is not 100% deterministic. In my testing, I've been remarkably surprised with how accurate the results are, but there are occasional issues mostly with differentiating whitespace between paragraphs versus soft section breaks. Note that both Calibre and Epubor also use heuristics to deal with things like spacing and dashes used by wordwrap, so the fidelity of the conversions will not be 100% one-to-one with the original Kindle version in any case.
+The main downside is that some transcription errors can occur during the `image ⇒ text` step, which uses a multimodal LLM and is not 100% deterministic. In testing, the results have been very accurate, but there are occasional issues around paragraph spacing, soft section breaks, and word wrapping. Calibre and Epubor also use heuristics for spacing and line wrapping, so no conversion path is perfectly one-to-one with the original Kindle rendering.
 
-The other downside is that the **LLM costs add up to a dollars per book using `gpt-4.1-mini`**. With LLM costs constantly decreasing and local vLLMs, this cost per book should be free or almost free soon. The screenshots are also really good quality with no extra content, so you could swap any other OCR solution for the vLLM-based `image ⇒ text` quite easily.
+The other downside is that the **LLM costs can add up to a few dollars per book using `gpt-4.1-mini`**. With LLM costs constantly decreasing and local multimodal models improving, this cost should keep falling. The screenshots are also high quality and contain little extra UI, so you can swap in another OCR or vision model if you prefer.
 
 ### How is the accuracy?
 
