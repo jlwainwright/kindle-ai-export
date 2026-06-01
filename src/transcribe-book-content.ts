@@ -34,7 +34,17 @@ async function main() {
   // const pageScreenshots = await globby(`${pageScreenshotsDir}/*.png`)
   // assert(pageScreenshots.length, 'no page screenshots found')
 
-  const openai = new OpenAIClient()
+  const openai = new OpenAIClient({
+    apiKey: getEnv('NINEROUTER_API_KEY'),
+    baseUrl: 'https://9router.jacqueswainwright.com/v1',
+    kyOptions: {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+      },
+      timeout: 180_000
+    }
+  })
 
   const content: ContentChunk[] = (
     await pMap(
@@ -61,7 +71,7 @@ async function main() {
 
           do {
             const res = await openai.createChatCompletion({
-              model: 'gpt-4.1-mini',
+              model: 'cx/gpt-5.5',
               temperature: retries < 2 ? 0 : 0.5,
               messages: [
                 {
@@ -137,7 +147,7 @@ Do not include any additional text, descriptions, or punctuation. Ignore any emb
           console.error(`error processing image ${index} (${screenshot})`, err)
         }
       },
-      { concurrency: 16 }
+      { concurrency: 6 }
     )
   ).filter(Boolean)
 

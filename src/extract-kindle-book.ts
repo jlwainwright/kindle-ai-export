@@ -579,8 +579,22 @@ async function main() {
       )
     }
 
-    await locator.click()
-    return true
+    // Retry the click with short timeouts, dismissing any alert that appears
+    // between finding the element and clicking it (e.g. "Most Recent Page Read").
+    const deadline = Date.now() + Math.max(timeout, 5000)
+    while (true) {
+      try {
+        await locator.click({ timeout: 2000 })
+        return true
+      } catch {
+        if (Date.now() >= deadline) break
+        await dismissPossibleAlert()
+        await delay(200)
+      }
+    }
+
+    if (optional) return false
+    throw new Error(`Unable to click visible selector: ${selectors.join(', ')}`)
   }
 
   async function firstTextContent(selectors: string[]) {
@@ -669,8 +683,10 @@ async function main() {
   }
 
   async function updateSettings() {
+    await dismissPossibleAlert()
     console.log('Looking for Reader settings button')
     await revealReaderChrome()
+    await dismissPossibleAlert()
     const settingsButton = await firstVisibleLocator(
       [
         'ion-button[aria-label="Reader settings"]',
@@ -689,13 +705,31 @@ async function main() {
       return
     }
 
+    // Dismiss any sync/page-jump alert that may have appeared during load,
+    // then click settings with retry in case the alert fires mid-click.
     console.log('Clicking Reader settings')
-    await settingsButton.click()
+    const settingsClickDeadline = Date.now() + 10_000
+    while (true) {
+      await dismissPossibleAlert()
+      try {
+        await settingsButton.click({ timeout: 2000 })
+        break
+      } catch {
+        if (Date.now() >= settingsClickDeadline) {
+          console.warn(
+            'Settings button click timed out; continuing with defaults'
+          )
+          return
+        }
+        await delay(200)
+      }
+    }
     await delay(500)
 
     // Change font to Amazon Ember
     // My hypothesis is that this font will be easier for OCR to transcribe...
     // TODO: evaluate different fonts & settings
+    await dismissPossibleAlert()
     console.log('Changing font to Amazon Ember')
     await clickFirstVisible(
       [
@@ -833,10 +867,43 @@ async function main() {
   }
 
   async function dismissPossibleAlert() {
-    const $alertNo = page.locator('ion-alert button', { hasText: 'No' })
-    if (await $alertNo.isVisible()) {
-      await $alertNo.click()
+    // Dismiss any active Kindle sync/page-jump alert.
+    const $alert = page.locator('ion-alert[is-open="true"]')
+    if (!(await $alert.isVisible().catch(() => false))) return
+
+    // Log the actual button texts so we can debug mismatches
+    const buttonTexts = await page.evaluate(() => {
+      const alert = document.querySelector('ion-alert[is-open="true"]')
+      if (!alert) return []
+      return Array.from(alert.querySelectorAll('button')).map(
+        (b) => b.textContent?.trim() ?? ''
+      )
+    })
+    console.log('dismissPossibleAlert buttons:', buttonTexts)
+
+    // Click the first button that looks like a dismiss/cancel action
+    const dismissPatterns = /no|stay|cancel|later|dismiss|not now/i
+    const dismissText = buttonTexts.find((t) => dismissPatterns.test(t))
+    if (dismissText) {
+      await page
+        .locator('ion-alert button', { hasText: dismissText })
+        .first()
+        .click({ force: true })
+      await delay(300)
+      return
     }
+
+    // Fallback: click the first button in the alert using force
+    const $firstBtn = $alert.locator('button').first()
+    if (await $firstBtn.isVisible().catch(() => false)) {
+      await $firstBtn.click({ force: true })
+      await delay(300)
+      return
+    }
+
+    // Last resort: Escape key
+    await page.keyboard.press('Escape')
+    await delay(300)
   }
 
   async function writeResultMetadata() {
@@ -941,6 +1008,11 @@ async function main() {
   // Navigate to the first content page of the book
   if (initialPageNav?.page !== result.nav.startContentPage) {
     await goToPage(result.nav.startContentPage)
+    // Wait for the reader to settle after navigation before starting the loop
+    await page
+      .waitForSelector(krRendererMainImageSelector, { timeout: 15_000 })
+      .catch(() => {})
+    await delay(1000)
   }
 
   let done = false
@@ -950,9 +1022,18 @@ async function main() {
 
   // Loop through each page of the book
   do {
-    const pageNav = await getPageNav()
+    // Retry getPageNav a few times to handle transient loading states
+    let pageNav = await getPageNav()
+    if (pageNav?.page === undefined) {
+      for (let i = 0; i < 5; i++) {
+        await delay(1000)
+        pageNav = await getPageNav()
+        if (pageNav?.page !== undefined) break
+      }
+    }
 
     if (pageNav?.page === undefined) {
+      console.warn('getPageNav returned undefined; breaking loop')
       break
     }
 
